@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-CAM 智能控制终端</title>
+    <style>
+        :root {
+            --primary-color: #2196F3;
+            --secondary-color: #607D8B;
+            --success-color: #4CAF50;
+            --danger-color: #f44336;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .nav-tabs {
+            display: flex;
+            background: #fff;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            border-radius: 8px 8px 0 0;
+            overflow: hidden;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-bottom: 3px solid transparent;
+        }
+
+        .tab.active {
+            border-color: var(--primary-color);
+            background: #f8f9fa;
+        }
+
+        .tab-content {
+            display: none;
+            background: #fff;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            border-radius: 0 0 8px 8px;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+
+        #videoStream {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .control-panel {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .card-title {
+            font-size: 1.1em;
+            color: var(--secondary-color);
+            margin-bottom: 15px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+        }
+
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: var(--primary-color);
+            color: white;
+        }
+
+        .btn-success {
+            background: var(--success-color);
+            color: white;
+        }
+
+        .btn-danger {
+            background: var(--danger-color);
+            color: white;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+        }
+
+        .led {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+
+        .led.on {
+            background: #00C853;
+            box-shadow: 0 0 8px #00C853;
+        }
+
+        .led.off {
+            background: #B0BEC5;
+        }
+
+        .sensor-data {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }
+
+        .sensor-item {
+            text-align: center;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .sensor-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin: 5px 0;
+        }
+
+        .refresh-control {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            margin: 15px 0;
+        }
+
+        #fpsSelect {
+            padding: 8px 12px;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+            margin-left: 10px;
+        }
+
+        .imu-container {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .imu-axis {
+            text-align: center;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        #trajectory-container {
+            width: 100%;
+            height: 400px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f8f9fa;
+        }
+
+        @media (max-width: 768px) {
+            .control-panel {
+                grid-template-columns: 1fr;
+            }
+            
+            .sensor-data, .imu-container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+    <!-- 引入Three.js库 -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-tabs">
+            <div class="tab active" onclick="switchTab('video')">视频监控</div>
+            <div class="tab" onclick="switchTab('control')">设备控制</div>
+            <div class="tab" onclick="switchTab('status')">状态监测</div>
+            <div class="tab" onclick="switchTab('location')">定位信息</div>
+        </div>
+
+        <!-- 视频监控选项卡 -->
+        <div id="video" class="tab-content active">
+            <div class="video-container">
+                <img id="videoStream" src="" alt="实时视频流">
+            </div>
+            <div class="refresh-control">
+                <span>刷新率：</span>
+                <select id="fpsSelect">
+                    <option value="1">1 FPS</option>
+                    <option value="2" selected>2 FPS</option>
+                    <option value="3">3 FPS</option>
+                    <option value="5">5 FPS</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- 设备控制选项卡 -->
+        <div id="control" class="tab-content">
+            <div class="control-panel">
+                <div class="card">
+                    <div class="card-title">方向控制</div>
+                    <div class="direction-controls">
+                        <button class="btn btn-primary" id="upBtn" 
+                            onmousedown="sendControl('up',1)" 
+                            onmouseup="sendControl('up',0)"
+                            ontouchstart="sendControl('up',1)"
+                            ontouchend="sendControl('up',0)">▲ 上</button>
+                        <div style="display: flex; gap:10px; margin:10px 0">
+                            <button class="btn btn-primary" id="leftBtn"
+                                onmousedown="sendControl('left',1)"
+                                onmouseup="sendControl('left',0)"
+                                ontouchstart="sendControl('left',1)"
+                                ontouchend="sendControl('left',0)">◀ 左</button>
+                            <button class="btn btn-primary" id="rightBtn"
+                                onmousedown="sendControl('right',1)"
+                                onmouseup="sendControl('right',0)"
+                                ontouchstart="sendControl('right',1)"
+                                ontouchend="sendControl('right',0)">▶ 右</button>
+                        </div>
+                        <button class="btn btn-primary" id="downBtn"
+                            onmousedown="sendControl('down',1)"
+                            onmouseup="sendControl('down',0)"
+                            ontouchstart="sendControl('down',1)"
+                            ontouchend="sendControl('down',0)">▼ 下</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">设备控制</div>
+                    <button class="btn btn-warning" onclick="capturePhoto()">拍照</button>
+                    <button class="btn btn-danger" onclick="sendCommand('stop')">紧急停止</button>
+                    <div class="status-indicator" style="margin-top:15px">
+                        <div class="led" id="ledStatus"></div>
+                        <span>照明状态</span>
+                        <div style="flex-grow:1"></div>
+                        <button class="btn btn-success" onclick="toggleLED()">切换灯光</button>
+                    </div>
+                    <div class="status-indicator" style="margin-top:15px">
+                        <div class="led" id="cleanStatus"></div>
+                        <span>清洁状态</span>
+                        <div style="flex-grow:1"></div>
+                        <button class="btn btn-success" onclick="toggleClean()">清洁控制</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">工作模式</div>
+                    <button class="btn btn-primary" id="modeBtn" onclick="toggleMode()">手动模式</button>
+                    <div class="sensor-item" style="margin-top:15px">
+                        <div>当前电压</div>
+                        <div class="sensor-value" id="voltage">--</div>
+                        <div>V</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 状态监测选项卡 -->
+        <div id="status" class="tab-content">
+            <div class="control-panel">
+                <div class="card">
+                    <div class="card-title">环境监测</div>
+                    <div class="sensor-data">
+                        <div class="sensor-item">
+                            <div>温度</div>
+                            <div class="sensor-value" id="temperature">--</div>
+                            <div>°C</div>
+                        </div>
+                        <div class="sensor-item">
+                            <div>湿度</div>
+                            <div class="sensor-value" id="humidity">--</div>
+                            <div>%</div>
+                        </div>
+                        <div class="sensor-item">
+                            <div>设备状态</div>
+                            <div class="sensor-value" id="deviceStatus">--</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 定位信息选项卡 -->
+        <div id="location" class="tab-content">
+            <div class="card">
+                <div class="card-title">IMU定位数据</div>
+                <div class="imu-container">
+                    <div class="imu-axis">
+                        <div>X轴</div>
+                        <div class="sensor-value" id="imuX">--</div>
+                        <div>m</div>
+                    </div>
+                    <div class="imu-axis">
+                        <div>Y轴</div>
+                        <div class="sensor-value" id="imuY">--</div>
+                        <div>m</div>
+                    </div>
+                    <div class="imu-axis">
+                        <div>Z轴</div>
+                        <div class="sensor-value" id="imuZ">--</div>
+                        <div>m</div>
+                    </div>
+                </div>
+                <div class="card-title">三维轨迹</div>
+                <div id="trajectory-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const esp32camIP = "192.168.53.223";
+        let currentFPS = 2;
+        let videoRefreshInterval;
+        let isVideoTabActive = true;
+        
+        // 轨迹数据存储
+        let trajectoryPoints = [];
+        const maxTrajectoryPoints = 100; // 最大存储点数
+        
+        // Three.js相关变量
+        let scene, camera, renderer, controls;
+        let trajectoryLine, pointCloud;
+        
+        // DOM元素
+        const videoStream = document.getElementById('videoStream');
+        const fpsSelect = document.getElementById('fpsSelect');
+
+        // 拍照功能
+        function capturePhoto() {
+            fetch(`http://${esp32camIP}/cmd?pic=1`)
+                // .then(response => {
+                //     if (response.ok) {
+                //         alert('拍照成功！');
+                //     } else {
+                //         alert('拍照失败，请重试');
+                //     }
+                // })
+                // .catch(err => {
+                //     console.error('拍照失败:', err);
+                //     alert('拍照失败，请检查连接');
+                // });
+        }
+        
+        // 初始化视频流
+        function initVideoStream() {
+            updateVideoStream();
+            setInterval(updateStatus, 2000); // 每2秒更新状态
+            setInterval(updateLocation, 4000); // 每4秒更新定位
+            
+            // 初始化三维轨迹可视化
+            initTrajectoryVisualization();
+        }
+
+        async function loadImageWithRetry() {
+            const timestamp = Date.now();
+            videoStream.src = `http://${esp32camIP}/jpg?t=${timestamp}&fps=${currentFPS}`;
+            
+            try {
+                await new Promise((resolve, reject) => {
+                    videoStream.onload = resolve;
+                    videoStream.onerror = () => reject(new Error('加载失败'));
+                });
+                return true;
+            } catch (e) {
+                console.error(e.message);
+                return false;
+            }
+        }
+
+        async function updateVideoStream() {
+            if (!isVideoTabActive) return;
+            
+            const success = await loadImageWithRetry();
+            const delay = success ? 5 : 5; // 成功按FPS延迟，失败1秒后重试
+            
+            videoRefreshInterval = setTimeout(updateVideoStream, delay);
+        }
+
+        function sendCommand(command) {
+            fetch(`http://${esp32camIP}/cmd?stop=1`)
+        }
+
+        // 发送控制命令
+        function sendControl(direction, state) {
+            fetch(`http://${esp32camIP}/control?dir=${direction}&state=${state}`)
+                .catch(err => console.error('控制命令失败:', err));
+        }
+
+        // 切换灯光
+        function toggleLED() {
+            // 翻转led状态
+            const ledElement = document.getElementById('ledStatus');
+            const currentState = ledElement.classList.contains('on');
+            const newState = currentState ? 0 : 1;
+
+            updateLEDStatus(newState);
+            
+            // 可以在这里添加加载状态
+            ledElement.classList.add('pending');
+            
+            fetch(`http://${esp32camIP}/cmd?light=${newState}`)
+                // .then(() => updateLEDStatus(newState))
+                // .catch(err => {
+                //     console.error('灯光控制失败:', err);
+                //     // 恢复之前的状态
+                //     updateLEDStatus(currentState ? 1 : 0);
+                //     alert('控制灯光失败，请检查连接');
+                // })
+                // .finally(() => {
+                //     ledElement.classList.remove('pending');
+                // });
+        }
+
+        // 更新LED状态
+        function updateLEDStatus(state) {
+            const ledElement = document.getElementById('ledStatus');
+            ledElement.className = `led ${state ? 'on' : 'off'}`;
+        }
+
+        // 切换清洁模式
+        function toggleClean() {
+            const clean = document.getElementById('cleanStatus').classList.contains('on') ? 0 : 1;
+            updateCleanStatus(clean)
+            fetch(`http://${esp32camIP}/cmd?clean=${clean}`)
+                // .then(() => updateCleanStatus(clean))
+                // .catch(err => console.error('清洁控制失败:', err));
+        }
+
+        // 更新清洁状态
+        function updateCleanStatus(state) {
+            const cleanElement = document.getElementById('cleanStatus');
+            cleanElement.className = `led ${state ? 'on' : 'off'}`;
+        }
+
+        // 切换工作模式
+        function toggleMode() {
+            const modeBtn = document.getElementById('modeBtn');
+            const newMode = modeBtn.textContent.includes('手动') ? 1 : 0;
+            modeBtn.textContent = newMode ? '自动模式' : '手动模式';
+            modeBtn.className = `btn btn-${newMode ? 'success' : 'primary'}`;
+            fetch(`http://${esp32camIP}/cmd?mode=${newMode}`)
+                // .then(() => {
+                    
+                // })
+                // .catch(err => console.error('模式切换失败:', err));
+        }
+
+        // 更新设备状态
+        async function updateStatus() {
+            try {
+                const response = await fetch(`http://${esp32camIP}/getstatus`);
+                const data = await response.json();
+                
+                // document.getElementById('voltage').textContent = data.voltage;
+                document.getElementById('voltage').textContent = 12;
+                document.getElementById('temperature').textContent = 22;
+                document.getElementById('humidity').textContent = 85;
+                document.getElementById('deviceStatus').textContent = data.direction;
+				document.getElementById('cleanStatus')
+            } catch (err) {
+                console.error('状态更新失败:', err);
+            }
+        }
+
+        // 更新定位信息
+        async function updateLocation() {
+            try {
+                const response = await fetch(`http://${esp32camIP}/locate`);
+                const data = await response.json();
+                
+                // 更新数值显示
+                // document.getElementById('imuX').textContent = data.x.toFixed(2);
+                // document.getElementById('imuY').textContent = data.y.toFixed(2);
+                // document.getElementById('imuZ').textContent = data.z.toFixed(2);
+                document.getElementById('imuX').textContent = 0;
+                document.getElementById('imuY').textContent = 0;
+                document.getElementById('imuZ').textContent = 0;
+                
+                // 更新轨迹数据
+                updateTrajectory(data.x, data.y, data.z);
+                
+            } catch (err) {
+                console.error('定位更新失败:', err);
+            }
+        }
+        
+        // 初始化三维轨迹可视化
+        function initTrajectoryVisualization() {
+            const container = document.getElementById('trajectory-container');
+            
+            // 创建场景
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+            
+            // 创建相机
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+            camera.position.set(5, 5, 5);
+            
+            // 创建渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+            
+            // 添加轨道控制器
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.25;
+            
+            // 添加坐标轴辅助
+            const axesHelper = new THREE.AxesHelper(3);
+            scene.add(axesHelper);
+            
+            // 添加网格地面
+            const gridHelper = new THREE.GridHelper(10, 10);
+            scene.add(gridHelper);
+            
+            // 创建轨迹线
+            const lineGeometry = new THREE.BufferGeometry();
+            const lineMaterial = new THREE.LineBasicMaterial({ color: 0x2196F3 });
+            trajectoryLine = new THREE.Line(lineGeometry, lineMaterial);
+            scene.add(trajectoryLine);
+            
+            // 创建点云
+            const pointsGeometry = new THREE.BufferGeometry();
+            const pointsMaterial = new THREE.PointsMaterial({ 
+                color: 0xff0000, 
+                size: 0.1,
+                sizeAttenuation: true
+            });
+            pointCloud = new THREE.Points(pointsGeometry, pointsMaterial);
+            scene.add(pointCloud);
+            
+            // 开始动画循环
+            animate();
+            
+            // 窗口大小调整事件
+            window.addEventListener('resize', () => {
+                camera.aspect = container.clientWidth / container.clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(container.clientWidth, container.clientHeight);
+            });
+        }
+        
+        // 更新轨迹数据
+        function updateTrajectory(x, y, z) {
+            // 添加新点
+            trajectoryPoints.push(new THREE.Vector3(x, y, z));
+            
+            // 限制轨迹点数量
+            if (trajectoryPoints.length > maxTrajectoryPoints) {
+                trajectoryPoints.shift();
+            }
+            
+            // 更新轨迹线
+            const lineGeometry = new THREE.BufferGeometry().setFromPoints(trajectoryPoints);
+            trajectoryLine.geometry.dispose();
+            trajectoryLine.geometry = lineGeometry;
+            
+            // 更新点云
+            const pointsGeometry = new THREE.BufferGeometry().setFromPoints(trajectoryPoints);
+            pointCloud.geometry.dispose();
+            pointCloud.geometry = pointsGeometry;
+            
+            // 自动调整相机视角
+            if (trajectoryPoints.length > 1) {
+                const boundingBox = new THREE.Box3().setFromPoints(trajectoryPoints);
+                const center = boundingBox.getCenter(new THREE.Vector3());
+                const size = boundingBox.getSize(new THREE.Vector3());
+                
+                // 计算合适的相机距离
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const cameraDistance = maxDim * 1.5;
+                
+                // 平滑移动相机
+                camera.position.lerp(
+                    new THREE.Vector3(
+                        center.x + cameraDistance,
+                        center.y + cameraDistance,
+                        center.z + cameraDistance
+                    ),
+                    0.1
+                );
+                
+                controls.target.copy(center);
+                controls.update();
+            }
+        }
+        
+        // 动画循环
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // 选项卡切换
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.getElementById(tabId).classList.add('active');
+            event.target.classList.add('active');
+
+            // 更新视频标签状态
+            isVideoTabActive = tabId === 'video';
+            
+            // 如果是视频标签，重新开始刷新
+            if (isVideoTabActive) {
+                updateVideoStream();
+            } else {
+                // 如果不是视频标签，清除刷新定时器
+                clearTimeout(videoRefreshInterval);
+            }
+        }
+
+        // 事件监听
+        fpsSelect.addEventListener('change', (e) => {
+            currentFPS = parseInt(e.target.value);
+            if (isVideoTabActive) {
+                updateVideoStream();
+            }
+        });
+
+        // 初始化
+        window.addEventListener('load', initVideoStream);
+    </script>
+</body>
+</html>

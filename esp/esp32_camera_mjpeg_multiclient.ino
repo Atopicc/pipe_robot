@@ -1,0 +1,617 @@
+/*
+  ESP32-CAM API接口版本 - 完整代码
+  功能：
+  1. 提供MJPEG视频流接口
+  2. 提供单帧JPEG接口
+  3. 提供方向控制API
+  4. 使用固定IP 192.168.53.223
+  5. 通过串口发送控制协议帧
+*/
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClient.h>
+#include "esp32-hal-uart.h"
+#include "FS.h"
+#include "SD_MMC.h"
+
+// 选择摄像头型号
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+#define BAUDRATE 115200
+
+// 接收缓冲区
+#define MAX_RECEIVE_LEN 128
+char receivedData[MAX_RECEIVE_LEN] = {0};
+unsigned int bufferIndex = 0;
+unsigned int lastReceiveTime = 0;
+bool newDataReceived = false;
+
+// 固定IP配置
+IPAddress local_IP(192, 168, 53, 223);
+IPAddress gateway(192, 168, 53, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// WiFi凭证 - 请修改为您的网络信息
+const char* ssid = ">_";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// 方向控制协议定义
+#define FRAME_HEADER 0xAA
+#define FRAME_TAIL 0xFF
+#define DEVICE_MAIN 0xD1
+#define DEVICE_CAM 0xD2
+#define DEVICE_EXT 0xD3
+#define STATUS_REC 0xC1
+#define VOLTAGE_REC 0xC2
+#define ENVIRONMENT_REC 0xC5
+#define IMU_REC 0xC6
+#define LED_CMD 0xC7
+#define CLEAN_REC 0xC8
+#define DIRECTION_CMD 0xC9
+#define STOP_CMD 0xCA
+#define MODE_CMD 0xCD
+#define CLEAN_CMD 0xCB
+#define FRAME_LENGTH 0x04
+
+unsigned char voltage = 0;
+unsigned char temperature = 0;
+unsigned char humidity = 0;
+char clean = 0;
+char automode = 0;
+char led = 0;
+char stop = 0;
+char status = 0;
+
+typedef union IMUData
+{
+  unsigned char bytes[6];
+  struct {
+    short x;
+    short y;
+    short z;
+  };
+}IMUData_t;
+IMUData_t imuData = {0,0,0};
+
+// 方向控制数据结构
+typedef struct {
+  bool up;
+  bool down;
+  bool fore_expend;
+  bool fore_shrink;
+  bool back_expend;
+  bool back_shrink;
+} DirectionControl;
+
+DirectionControl currentDirection = {false, false, false, false, false, false};
+DirectionControl lastSentDirection = {false, false, false, false, false, false};
+
+// 帧同步信号量
+SemaphoreHandle_t frameSync = NULL;
+
+// ===== 函数声明 =====
+void sendDirectionFrame(DirectionControl dir);
+void checkAndSendDirection();
+void handleControlAPI();
+void handleJPG();
+void handleSatatus();
+void handleCMDAPI();
+void handleNotFound();
+void handleLocateAPI();
+void CameraInit();
+void WIFIinit();
+void SDCardInit();
+void PictureTask();
+void SendFrame(char dev,char cmd,char len,char *data);
+// ===== 主程序 =====
+void setup() {
+  Serial.begin(BAUDRATE);
+
+  // pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+
+  CameraInit();
+  WIFIinit();
+  SDCardInit();
+  // PictureTask();
+  // Serial.println("The size of short is %d, int is %d, long is %d, long long is %d", sizeof(short), sizeof(int), sizeof(long), sizeof(long long));
+}
+
+void loop() {
+  // 检查是否有数据可读
+  receiveData();
+  
+  // 如果有新数据到达
+  if (newDataReceived) {
+    processData(receivedData);
+    newDataReceived = false;
+    memset(receivedData, 0, sizeof(receivedData));
+  }
+
+  server.handleClient();
+  
+  // 定期检查方向状态
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 100) {
+    checkAndSendDirection();
+    lastCheck = millis();
+  }
+
+  // PictureTask();
+  
+  delay(2);
+}
+
+// ===== 功能函数实现 =====
+
+// 发送方向控制帧
+void sendDirectionFrame(DirectionControl dir) {
+  uint8_t frame[11] = {
+    FRAME_HEADER,
+    DEVICE_MAIN,
+    DIRECTION_CMD,
+    0x06,
+    dir.up ? 0x01 : 0x00,
+    dir.down ? 0x01 : 0x00,
+    dir.fore_expend ? 0x01 : 0x00,
+    dir.fore_shrink ? 0x01 : 0x00,
+    dir.back_expend ? 0x01 : 0x00,
+    dir.back_shrink ? 0x01 : 0x00,
+    FRAME_TAIL
+  };
+  
+  Serial.write(frame, sizeof(frame));
+  Serial.flush();
+}
+
+// 检查并发送方向状态
+void checkAndSendDirection() {
+  if (memcmp(&currentDirection, &lastSentDirection, sizeof(DirectionControl)) != 0) {
+    sendDirectionFrame(currentDirection);
+    memcpy(&lastSentDirection, &currentDirection, sizeof(DirectionControl));
+  }
+}
+
+// 处理控制API
+void handleControlAPI() {
+  String direction = server.arg("dir");
+  String state = server.arg("state");
+  
+  if (direction == "up") currentDirection.up = (state == "1");
+  else if (direction == "down") currentDirection.down = (state == "1");
+  else if (direction == "fore_expend") currentDirection.fore_expend = (state == "1");
+  else if (direction == "fore_shrink") currentDirection.fore_shrink = (state == "1");
+  else if (direction == "back_expend") currentDirection.back_expend = (state == "1");
+  else if (direction == "back_shrink") currentDirection.back_shrink = (state == "1");
+  
+  checkAndSendDirection();
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+// 单帧JPEG处理
+void handleJPG() {
+  WiFiClient client = server.client();
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: image/jpeg\r\n";
+  response += "Content-Length: " + String(fb->len) + "\r\n";
+  response += "Connection: close\r\n";
+  response += "Access-Control-Allow-Origin: *\r\n\r\n";
+  client.print(response);
+  client.write(fb->buf, fb->len);
+  client.stop();
+
+  esp_camera_fb_return(fb);
+}
+
+// 404处理
+void handleNotFound() {
+  String message = "你来到了没有知识的荒野！\n\n";
+  
+  server.send(404, "text/plain", message);
+}
+
+// 接收串口数据
+void receiveData() {
+  while (Serial.available() > 0) {
+    char inChar = Serial.read();
+
+    // 检测缓冲区溢出
+    if (bufferIndex >= MAX_RECEIVE_LEN - 1) {
+      bufferIndex = 0;  // 清空缓冲区（防止溢出）
+      Serial.println("[ERROR] Buffer overflow!");
+      return;
+    }
+
+    receivedData[bufferIndex++] = inChar;
+    lastReceiveTime = millis();  // 更新最后接收时间
+
+    // 检测帧结束符（0xFF）
+    if (inChar == 0xFF) {
+      receivedData[bufferIndex] = '\0';  // 字符串结束符
+      newDataReceived = true;
+      bufferIndex = 0;
+      return;
+    }
+  }
+
+  // 超时检测（超过 1 秒没有新数据就清空缓冲区）
+  if (bufferIndex > 0 && millis() - lastReceiveTime > 1000) {
+    Serial.println("[WARN] Receive timeout, reset buffer.");
+    bufferIndex = 0;
+    return;
+  }
+}
+
+// 处理接收到的数据
+void processData(char* p) {
+  if(*p == FRAME_HEADER && *(p+1) == DEVICE_CAM)
+  {
+    Serial.println("Received frame on camera device");
+    p+=2;
+    if(*p == STATUS_REC && *(p+1) == 1) // 状态帧
+    {
+      p+=2;
+      status = *p;
+    }else if(*p == VOLTAGE_REC && *(p+1) == 1)
+    {
+      p+=2;
+      voltage = *p;
+    }else if(*p == ENVIRONMENT_REC && *(p+1) == 2)
+    {
+      p+=2;
+      temperature = *p;
+      p++;
+      humidity = *p;
+    }else if(*p == IMU_REC && *(p+1) == 6)
+    {
+      p+=2;
+      Serial.println(*p,HEX);
+      imuData.bytes[0] = *p;
+      p++;
+      Serial.println(*p,HEX);
+      imuData.bytes[1] = *p;
+      p++;
+      Serial.println(*p,HEX);
+      imuData.bytes[2] = *p;
+      p++;
+      Serial.println(*p,HEX);
+      imuData.bytes[3] = *p;
+      p++;
+      Serial.println(*p,HEX);
+      imuData.bytes[4] = *p;
+      p++;
+      Serial.println(*p,HEX);
+      imuData.bytes[5] = *p;
+    }else if(*p == LED_CMD && *(p+1) == 1)
+    {
+      p+=2;
+      led = *p;
+      if(led){
+        pinMode(4,OUTPUT);
+        digitalWrite(4, HIGH);
+      }
+      else digitalWrite(4,LOW);
+    }else if(*p == CLEAN_REC && *(p+1) == 1)
+    {
+      p+=2;
+      clean = *p;
+    }else if(*p == 0xC4 && *(p+1) == 1)
+    {
+      takeAndSavePhoto();
+    }else return;
+  }
+}
+
+void CameraInit()
+{
+  // 初始化摄像头
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // 根据PSRAM选择帧尺寸
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 15;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 15;
+    config.fb_count = 1;
+  }
+
+  // 初始化摄像头
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  // 初始化帧同步信号量
+  frameSync = xSemaphoreCreateBinary();
+  xSemaphoreGive(frameSync);
+}
+
+void WIFIinit()
+{
+  // 配置固定IP
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("STA Failed to configure");
+  }
+
+  // 连接WiFi
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+
+  // 注册API端点
+  server.on("/jpg", HTTP_GET, handleJPG); // 获取一帧JPEG图片
+  server.on("/getstatus",HTTP_GET,handleSatatus); // 获取状态信息
+  server.on("/control", HTTP_GET, handleControlAPI); // 控制API
+  server.on("/cmd", HTTP_GET, handleCMDAPI); // 发送命令指令API
+  server.on("/locate", HTTP_GET, handleLocateAPI); // 获取IMU数据API
+  server.onNotFound(handleNotFound); // 404处理
+
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  // 打印访问信息
+  Serial.print("Camera Stream URL: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/mjpeg/1");
+  Serial.print("Control API: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/control?dir=[direction]&state=[0|1]");
+}
+
+void SDCardInit()
+{
+  // 初始化SD卡
+  if(!SD_MMC.begin()){
+    Serial.println("SD Card Mount Failed");
+    return;
+  }
+  
+  uint8_t cardType = SD_MMC.cardType();
+  if(cardType == CARD_NONE){
+    Serial.println("No SD card attached");
+    return;
+  }
+  Serial.print("SD Card Type: ");
+  if(cardType == CARD_MMC){
+    Serial.println("MMC");
+  } else if(cardType == CARD_SD){
+    Serial.println("SDSC");
+  } else if(cardType == CARD_SDHC){
+    Serial.println("SDHC");
+  } else {
+    Serial.println("Unknown");
+  }
+
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+}
+
+void takeAndSavePhoto() {
+  // 拍照
+  camera_fb_t * fb = NULL;
+  fb = esp_camera_fb_get();
+  if(!fb) {
+    Serial.println("Failed to get frame buffer");
+    return;
+  }
+  
+  // 生成文件名
+  char filename[32];
+  sprintf(filename, "/photo_%d.jpg", millis());
+  
+  // 保存照片到SD卡
+  fs::FS &fs = SD_MMC;
+  File file = fs.open(filename, FILE_WRITE);
+  if(!file){
+    Serial.println("Cannot create file");
+  } else {
+    file.write(fb->buf, fb->len);
+    Serial.printf("Photo saved: %s, size: %d bytes\n", filename, fb->len);
+    file.close();
+  }
+  
+  // 释放摄像头缓冲区
+  esp_camera_fb_return(fb);
+  
+  // // 列出SD卡中的文件（可选）
+  // listFiles();
+}
+
+// 列出SD卡中的文件（用于调试）
+void listFiles() {
+  Serial.println("Files:");
+  
+  fs::FS &fs = SD_MMC;
+  File root = fs.open("/");
+  
+  File file = root.openNextFile();
+  while(file){
+    if(!file.isDirectory()){
+      Serial.print("  FILE: ");
+      Serial.print(file.name());
+      Serial.print("  SIZE: ");
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+void PictureTask() {
+  // 拍照任务
+  static unsigned long lastPicture = 0;
+  if (millis() - lastPicture > 1000) {
+    takeAndSavePhoto();
+    lastPicture = millis();
+  }
+}
+
+void handleSatatus() {
+  // 返回状态信息{"voltage":(percetage),"temperature":%d,"humidity":%d,"direction":(up or down or stop),"light":(bool,on or off),"cleaning":(bool,on or off)}
+  // 初始化http回复
+  WiFiClient client = server.client();
+  
+  // Create JSON response
+  String jsonResponse = "{";
+  jsonResponse += "\"voltage\":" + String(voltage);
+  jsonResponse += ",\"temperature\":" + String(temperature);
+  jsonResponse += ",\"humidity\":" + String(humidity);
+  jsonResponse += ",\"direction\":\"" + String((status== 1) ? "up" : (status == 2) ? "down" : "stop") + "\"";
+  jsonResponse += ",\"light\":" + String(led ? "true" : "false");
+  jsonResponse += ",\"cleaning\":" + String(clean ? "true" : "false");
+  jsonResponse += "}";
+
+  // Prepare HTTP headers
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: application/json\r\n";
+  response += "Connection: close\r\n";
+  response += "Access-Control-Allow-Origin: *\r\n";
+  response += "Content-Length: " + String(jsonResponse.length()) + "\r\n";
+  response += "\r\n";  // End of headers
+  response += jsonResponse;
+
+  client.print(response);
+}
+
+void handleCMDAPI()
+{
+  // 控制指令：
+  //stop light clean mode
+  // 获取arg
+  String Stop_arg = server.arg("stop");
+  String Light_arg = server.arg("light");
+  String Clean_arg = server.arg("clean");
+  String Mode_arg = server.arg("mode");
+  String pic = server.arg("pic");
+
+  // 处理指令
+
+  if(pic == "1")
+  {
+    takeAndSavePhoto();
+  }
+
+  if(Stop_arg == "1")
+  {
+    // 停止指令并更新状态
+    SendFrame(DEVICE_MAIN,STOP_CMD,1,(char*)&stop);
+    currentDirection.up = false;
+    currentDirection.down = false;
+    status = 0;
+  }
+
+  if(Light_arg == "1")
+  {
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH);
+    led = true;
+  }else if(Light_arg == "0")
+  {
+    digitalWrite(4, LOW);
+    led = false;
+  }
+
+  if(Clean_arg == "1")
+  {
+    // 添加清洁指令并更新状态
+    clean = true;
+    SendFrame(DEVICE_EXT,CLEAN_CMD,1,(char*)&clean);
+  }else if(Clean_arg == "0")
+  {
+    //关闭清洁指令并更新状态
+    clean = false;
+    SendFrame(DEVICE_EXT,CLEAN_CMD,1,(char*)&clean);
+  }
+
+  if(Mode_arg == "1")
+  {
+    // 自动模式开启
+    automode = true;
+    SendFrame(DEVICE_MAIN,MODE_CMD,1,(char*)&automode);
+  }else if(Mode_arg == "0")
+  {
+    automode = false;
+    SendFrame(DEVICE_MAIN,MODE_CMD,1,(char*)&automode);
+  }
+
+  //回复http请求
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void SendFrame(char dev,char cmd,char len,char *data)
+{
+  Serial.write(FRAME_HEADER);
+  Serial.write(dev);
+  Serial.write(cmd);
+  Serial.write(len);
+  for(int i=0;i<len;i++)
+  {
+    Serial.write(data[i]);
+  }
+  Serial.write(FRAME_TAIL);
+  Serial.flush();
+}
+
+void handleLocateAPI()
+{
+  WiFiClient client = server.client();
+  
+  // Create JSON response
+  String jsonResponse = "{";
+  jsonResponse += "\"x\":" + String(imuData.x);
+  jsonResponse += ",\"y\":" + String(imuData.y);
+  jsonResponse += ",\"z\":" + String(imuData.z);
+  jsonResponse += "}";
+
+  // Prepare HTTP headers
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: application/json\r\n";
+  response += "Connection: close\r\n";
+  response += "Access-Control-Allow-Origin: *\r\n";
+  response += "Content-Length: " + String(jsonResponse.length()) + "\r\n";
+  response += "\r\n";  // End of headers
+  response += jsonResponse;
+
+  client.print(response);
+}
